@@ -16,35 +16,35 @@ import (
 
 var (
 	fd          int
+	BUDGETS     uint64
 	file        *os.File
-	THRESHOLD   = 0.1
-	HIGH_BUDGET = 100
-	LOW_BUDGET  = 1
+	THRESHOLD          = 0.01
+	HIGH_BUDGET uint64 = 100
+	LOW_BUDGET  uint64 = 1
+	BitSet             = make([]byte, 1<<30)
 )
 
 type void struct{}
 
 var (
-	nop       void
 	PCSs      map[uint32]*PCS
 	eth       = layers.Ethernet{EthernetType: layers.EthernetTypeIPv6}
 	ip6       = layers.IPv6{Version: 6, NextHeader: layers.IPProtocolICMPv6, HopLimit: 255}
 	icmp6     = layers.ICMPv6{TypeCode: layers.CreateICMPv6TypeCode(128, 0)} // icmpv6 echorequest
-	icmp6echo = layers.ICMPv6Echo{}
+	icmp6echo = layers.ICMPv6Echo{Identifier: 0x7, SeqNumber: 0x9}
+	payload   = gopacket.Payload([]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
 )
 
 type PCS struct {
 	sync.Mutex
 	stub   uint64
 	offset uint64
-	hit    map[uint32]void // unique IPv6
-	n      uint32          // entire
-	mu     float64
-	sigma  float64
+	hit    uint64
+	count  uint64 // entire
 }
 
-func murmur3(data []byte) uint32 {
-	hash := uint32(time.Now().Nanosecond() & 0xffff_ffff)
+func murmur3(data []byte, seed uint32) uint32 {
+	hash := seed
 	for i := 0; i < 16; i = i + 4 {
 		k := binary.BigEndian.Uint32(data[i : i+4])
 		k = k * 0xcc9e2d51
@@ -65,27 +65,29 @@ func Recv() {
 	buf := make([]byte, 1000)
 	for {
 		if n, _, err := unix.Recvfrom(fd, buf, 0); err != nil {
-			fmt.Println(fd)
-			fmt.Println(err, 11)
+			fmt.Println(fd, err)
 		} else {
-			// see https://gist.github.com/GeekerYT/d8f3c30af8424e7006ef6df52c1a93ff
+			// Keys of Bloom filters
 			switch buf[54] {
-			// case 129:
-			// 	// fmt.Fprintf(file, "%x,%s,%d,%d,%d,%d\n", buf[22:30], net.IP(buf[22:38]), buf[54], buf[55], buf[21], n)
-			// 	// idx := binary.BigEndian.Uint64(buf[22:30])
-			// case 3:
-			// 	// fmt.Fprintf(file, "%x,%s,%d,%d,%d,%d\n", buf[86:94], net.IP(buf[22:38]), buf[54], buf[55], buf[21], n)
-			case 3:
+			case 129:
+				fmt.Fprintf(file, "%x,%s,%d-alias,%d,%d,%d\n", buf[22:30], net.IP(buf[22:38]), buf[54], buf[55], buf[21], n)
+			case 1, 3:
+				i := murmur3(buf[22:38], 0x12345678)
+				j := murmur3(buf[22:38], 0x87654321)
+				// Check if the ip is in BitSet
+				if BitSet[i/8]&(1<<(i%8)) != 0 && BitSet[j/8]&(1<<(j%8)) != 0 {
+					continue
+				}
 				fmt.Fprintf(file, "%x,%s,%d,%d,%d,%d\n", buf[86:94], net.IP(buf[22:38]), buf[54], buf[55], buf[21], n)
-				idx := binary.BigEndian.Uint64(buf[86:94])
-				key := murmur3(buf[22:38])
-				i := uint32(idx >> 32)
-				PCSs[i].Lock()
-				PCSs[i].hit[key] = nop
-				p := float64(len(PCSs[i].hit)) / float64(PCSs[i].n)
-				PCSs[i].mu = p
-				PCSs[i].sigma = math.Sqrt(p*(1-p)) / math.Log(float64(PCSs[i].n))
-				PCSs[i].Unlock()
+				BitSet[i/8] |= (1 << (i % 8))
+				BitSet[j/8] |= (1 << (j % 8))
+
+				idx := binary.BigEndian.Uint32(buf[86:90])
+				if _, ok := PCSs[idx]; ok {
+					PCSs[idx].Lock()
+					PCSs[idx].hit += 1
+					PCSs[idx].Unlock()
+				}
 			}
 		}
 	}
@@ -104,49 +106,62 @@ func Scan(prefixes []uint64) {
 		binary.BigEndian.PutUint64(Dst[8:], identifier)
 		ip6.DstIP = Dst
 		icmp6.SetNetworkLayerForChecksum(&ip6)
-		gopacket.SerializeLayers(buffer, opts, &eth, &ip6, &icmp6, &icmp6echo)
+		icmp6echo.Identifier = 5*icmp6echo.Identifier + 7
+		icmp6echo.SeqNumber = 5*icmp6echo.SeqNumber + 7
+
+		gopacket.SerializeLayers(buffer, opts, &eth, &ip6, &icmp6, &icmp6echo, &payload)
 		unix.Send(fd, buffer.Bytes(), unix.MSG_WAITALL)
-		time.Sleep(time.Microsecond)
 	}
 }
 
-func Alloc() []uint64 { // Budgets is the max value of ONE prefix (usually less)
+func Alloc() []uint64 {
 	prefixes := []uint64{}
-	find := 0
-	probe := 0
+	var probe, found, subnet uint64 = 0, 0, rand.Uint64() & 0xf
+	var mu, sigma float64
 	for i := range PCSs {
 		PCSs[i].Lock()
-		find += len(PCSs[i].hit)
-		probe += int(PCSs[i].n)
-		r := PCSs[i].mu + PCSs[i].sigma*rand.NormFloat64()
-		BUDGET := LOW_BUDGET
-		if r > THRESHOLD {
-			BUDGET = HIGH_BUDGET
+		probe += PCSs[i].count
+		found += PCSs[i].hit
+		if mu = float64(PCSs[i].hit) / float64(PCSs[i].count); math.IsNaN(mu) {
+			mu = 0.0
 		}
-		for j := 0; j < BUDGET; j++ {
-			idx := PCSs[i].stub + PCSs[i].offset
+
+		if sigma = math.Sqrt(mu*(1-mu)) / math.Log2(float64(PCSs[i].count)); math.IsNaN(sigma) {
+			sigma = 0.0
+		}
+		r := mu + sigma*rand.NormFloat64()
+		b := LOW_BUDGET
+		if r > THRESHOLD {
+			b = HIGH_BUDGET
+		}
+		if b > (1<<28)-PCSs[i].count {
+			b = (1 << 28) - PCSs[i].count
+		}
+		for j := 0; j < int(b); j++ {
+			idx := PCSs[i].stub + (PCSs[i].offset << 4) + subnet // /60 -> /64
+			subnet = (5*subnet + 7) & 0xf
 			prefixes = append(prefixes, idx)
-			PCSs[i].offset = (1664525*PCSs[i].offset + 1013904223) & 0xffff_ffff //
-			PCSs[i].n = PCSs[i].n + 1
+			PCSs[i].offset = (1664525*PCSs[i].offset + 1013904223) & 0xffff_fff
+			PCSs[i].count += 1
 		}
 		PCSs[i].Unlock()
 	}
-	fmt.Printf("Send %d Recv %d, %d target in this round\n", probe, find, len(prefixes))
+	fmt.Printf("%d probed, %d found, %d targets in this round\n", probe, found, len(prefixes))
 	return prefixes
 
 }
 func main() {
+	st := time.Now()
 	rand.Seed(time.Now().UnixNano())
 	Prepare()
 	go Recv()
-	for j := uint64(0); j < 0xffff_ffff; {
-		st := time.Now()
+	for j := uint64(0); j < BUDGETS; {
 		prefixes := Alloc()
-		fmt.Println("Time : ", time.Since(st))
 		Scan(prefixes)
 		j += uint64(len(prefixes))
 	}
 	fmt.Println("Scanning Over! Waiting 5 Second")
 	time.Sleep(5 * time.Second)
 	file.Close()
+	fmt.Println("Time : ", time.Since(st))
 }
