@@ -1,17 +1,19 @@
 # 6Seeks (old version)
 
-This tools aims to scan the internet-wide IPv6 network periphery. It is an asynchronous scanner which incrementally adjusts search directions, automatically prioritizing the survey of IPv6 address spaces with a higher concentration of IPv6 periphery devices. Its network periphery model is inspired by [Xmap]{https://github.com/idealeer/xmap}.
+This tool is designed with the purpose of comprehensively scanning the IPv6 network periphery across the entire internet. Operating as an asynchronous scanner, it dynamically refines search directions. It intelligently prioritizes scanning IPv6 networks that host a larger number of network peripher devices. Its network periphery model is inspired by [Xmap](https://github.com/idealeer/xmap).
 
 # Implentations
 
 The implentations of (old) 6Seeks are introduced into [Scanning the Internet-wide Network Periphery: Towards IPv6 Vulnerability Discovery](old-6Seeks.pdf).
 
-This paper has been rejected and We put it here in the hope that it helps.
+The manuscript in question has undergone a rejection in the peer-review process. Nevertheless, it is presented here with the aspiration that its contents may provide assistance or insight in some capacity.
 
 
 # PR
+The development of 6Seeks will persist, with an impending release of an upgraded iteration anticipated in the near future. The progression can be monitored by transitioning to the `master` branch.
 
-We will continue develop 6Seeks, and a newly-improved 6Seeksa  will be available soon.
+
+
 
 
 
